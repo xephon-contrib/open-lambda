@@ -27,6 +27,8 @@ type Config struct {
 	Cluster_name string `json:"cluster_name"`
 	// pip mirror address for installing python packages
 	Pip_mirror string `json:"pip_mirror"`
+	// pip mirror for archived installed python packages
+	Unpack_mirror string `json:"unpack_mirror"`
 
 	// pool options
 	// directory storing socket files for each forked server
@@ -143,6 +145,21 @@ func (c *Config) Defaults() error {
 			return err
 		}
 		c.Worker_dir = path
+	}
+
+	if c.Unpack_mirror == "" {
+		c.Unpack_mirror = "/tmp/.open_lambda/pip/"
+	}
+
+	if !path.IsAbs(c.Unpack_mirror) {
+		if c.path == "" {
+			return fmt.Errorf("Unpack_mirror cannot be relative, unless config is loaded from file")
+		}
+		path, err := filepath.Abs(path.Join(path.Dir(c.path), c.Unpack_mirror))
+		if err != nil {
+			return err
+		}
+		c.Unpack_mirror = path
 	}
 
 	// cgroup sandboxes require some extra settings

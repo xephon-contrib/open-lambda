@@ -31,7 +31,7 @@ func cmd(args []string) error {
 }
 
 // Create creates a docker sandbox from the handler and sandbox directory.
-func (self *CgroupSBFactory) Create(handlerDir string, sandboxDir string) (Sandbox, error) {
+func (self *CgroupSBFactory) Create(handlerDir string, sandboxDir string, pipDir string) (Sandbox, error) {
 	root, err := ioutil.TempDir(os.TempDir(), "sandbox_")
 	if err != nil {
 		return nil, err
@@ -50,6 +50,11 @@ func (self *CgroupSBFactory) Create(handlerDir string, sandboxDir string) (Sandb
 	err = cmd([]string{"/bin/mount", "--bind", sandboxDir, path.Join(root, "host")})
 	if err != nil {
 		return nil, fmt.Errorf("Failed to bind host dir: %v", err.Error())
+	}
+
+	err = cmd([]string{"/bin/mount", "--bind", "-o", "ro", pipDir, path.Join(root, "pip-packages")})
+	if err != nil {
+		return nil, fmt.Errorf("Failed to bind pip dir: %v", err.Error())
 	}
 
 	sandbox, err := NewCgroupSandbox(self.opts, root)

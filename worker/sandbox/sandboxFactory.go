@@ -13,7 +13,7 @@ import (
 
 // SandboxFactory is the common interface for all sandbox creation functions.
 type SandboxFactory interface {
-	Create(handlerDir string, sandboxDir string) (sandbox Sandbox, err error)
+	Create(handlerDir string, sandboxDir string, pipDir string) (sandbox Sandbox, err error)
 }
 
 func InitSandboxFactory(config *config.Config) (sf SandboxFactory, err error) {
@@ -39,6 +39,7 @@ type emptySBInfo struct {
 	sandbox    Sandbox
 	handlerDir string
 	sandboxDir string
+	pipDir     string
 }
 
 // BufferedSBFactory maintains a buffer of sandboxes created by another factory.
@@ -73,10 +74,11 @@ func NewDockerSBFactory(opts *config.Config) (*DockerSBFactory, error) {
 }
 
 // Create creates a docker sandbox from the handler and sandbox directory.
-func (df *DockerSBFactory) Create(handlerDir string, sandboxDir string) (Sandbox, error) {
+func (df *DockerSBFactory) Create(handlerDir string, sandboxDir string, pipDir string) (Sandbox, error) {
 	volumes := []string{
 		fmt.Sprintf("%s:%s:ro,slave", handlerDir, "/handler"),
 		fmt.Sprintf("%s:%s:slave", sandboxDir, "/host"),
+		fmt.Sprintf("%s:%s:ro,slave", pipDir, "/pip-packages"),
 	}
 	container, err := df.client.CreateContainer(
 		docker.CreateContainerOptions{
@@ -99,26 +101,33 @@ func (df *DockerSBFactory) Create(handlerDir string, sandboxDir string) (Sandbox
 	return sandbox, nil
 }
 
-// mkSBDirs makes the handler and sandbox directories and tries to unmount them.
-func mkSBDirs(bufDir string) (string, string, error) {
+// mkSBDirs makes the handler, sandbox and pip directories and tries to unmount them.
+func mkSBDirs(bufDir string) ([]string, error) {
 	if err := os.MkdirAll(bufDir, os.ModeDir); err != nil {
-		return "", "", fmt.Errorf("fail to create directory at %s: %v", bufDir, err)
+		return nil, fmt.Errorf("fail to create directory at %s: %v", bufDir, err)
 	}
 	handlerDir := filepath.Join(bufDir, "handler")
 	if err := os.MkdirAll(handlerDir, os.ModeDir); err != nil {
-		return "", "", fmt.Errorf("fail to create directory at %s: %v", handlerDir, err)
+		return nil, fmt.Errorf("fail to create directory at %s: %v", handlerDir, err)
 	}
 	if err := syscall.Unmount(handlerDir, 0); err != nil && err != syscall.EINVAL {
-		return "", "", fmt.Errorf("fail to unmount directory %s: %v", handlerDir, err)
+		return nil, fmt.Errorf("fail to unmount directory %s: %v", handlerDir, err)
 	}
 	sandboxDir := filepath.Join(bufDir, "host")
 	if err := os.MkdirAll(sandboxDir, os.ModeDir); err != nil {
-		return "", "", fmt.Errorf("fail to create directory at %s: %v", sandboxDir, err)
+		return nil, fmt.Errorf("fail to create directory at %s: %v", sandboxDir, err)
 	}
 	if err := syscall.Unmount(sandboxDir, 0); err != nil && err != syscall.EINVAL {
-		return "", "", fmt.Errorf("fail to unmount directory %s: %v", sandboxDir, err)
+		return nil, fmt.Errorf("fail to unmount directory %s: %v", sandboxDir, err)
 	}
-	return handlerDir, sandboxDir, nil
+	pipDir := filepath.Join(bufDir, "pip-packages")
+	if err := os.MkdirAll(pipDir, os.ModeDir); err != nil {
+		return nil, fmt.Errorf("fail to create directory at %s: %v", pipDir, err)
+	}
+	if err := syscall.Unmount(pipDir, 0); err != nil && err != syscall.EINVAL {
+		return nil, fmt.Errorf("fail to unmount directory %s: %v", pipDir, err)
+	}
+	return []string{handlerDir, sandboxDir, pipDir}, nil
 }
 
 // NewBufferedSBFactory creates a BufferedSBFactory and starts a go routine to
@@ -139,10 +148,10 @@ func NewBufferedSBFactory(opts *config.Config, delegate SandboxFactory) (*Buffer
 		idx := 0
 		for {
 			bufDir := filepath.Join(bf.mntDir, fmt.Sprintf("%d", idx))
-			if handlerDir, sandboxDir, err := mkSBDirs(bufDir); err != nil {
+			if dirs, err := mkSBDirs(bufDir); err != nil {
 				bf.buffer <- nil
 				bf.errors <- err
-			} else if sandbox, err := bf.delegate.Create(handlerDir, sandboxDir); err != nil {
+			} else if sandbox, err := bf.delegate.Create(dirs[0], dirs[1], dirs[2]); err != nil {
 				bf.buffer <- nil
 				bf.errors <- err
 			} else if err := sandbox.Start(); err != nil {
@@ -152,7 +161,7 @@ func NewBufferedSBFactory(opts *config.Config, delegate SandboxFactory) (*Buffer
 				bf.buffer <- nil
 				bf.errors <- err
 			} else {
-				bf.buffer <- &emptySBInfo{sandbox, handlerDir, sandboxDir}
+				bf.buffer <- &emptySBInfo{sandbox, dirs[0], dirs[1], dirs[2]}
 				bf.errors <- nil
 			}
 			idx++
@@ -165,13 +174,15 @@ func NewBufferedSBFactory(opts *config.Config, delegate SandboxFactory) (*Buffer
 // Create mounts the handler and sandbox directories to the ones already
 // mounted in the sandbox, and returns that sandbox. The sandbox would be in
 // Paused state, instead of Stopped.
-func (bf *BufferedSBFactory) Create(handlerDir string, sandboxDir string) (Sandbox, error) {
+func (bf *BufferedSBFactory) Create(handlerDir string, sandboxDir string, pipDir string) (Sandbox, error) {
 	mntFlag := uintptr(syscall.MS_BIND | syscall.MS_REC)
 	if info, err := <-bf.buffer, <-bf.errors; err != nil {
 		return nil, err
 	} else if err := syscall.Mount(handlerDir, info.handlerDir, "", mntFlag, ""); err != nil {
 		return nil, err
 	} else if err := syscall.Mount(sandboxDir, info.sandboxDir, "", mntFlag, ""); err != nil {
+		return nil, err
+	} else if err := syscall.Mount(pipDir, info.pipDir, "", mntFlag, ""); err != nil {
 		return nil, err
 	} else {
 		return info.sandbox, nil

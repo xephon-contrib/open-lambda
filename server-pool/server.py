@@ -68,6 +68,7 @@ def lambda_server():
 
 # listen for fds to forkenter
 def fdlisten(path):
+    sys.path.append('/pip-packages')
     r = -1
     # only child ever escapes the loop
     while r != 0:
@@ -79,6 +80,7 @@ def fdlisten(path):
 
         r = ns.forkenter()
 
+    sys.path.pop()
     init()
     lambda_server()
 

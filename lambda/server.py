@@ -6,6 +6,8 @@ import tornado.web
 import tornado.httpserver
 import tornado.netutil
 
+sys.path.append('/pip-packages')
+
 HOST_PATH = '/host'
 SOCK_PATH = '%s/ol.sock' % HOST_PATH
 STDOUT_PATH = '%s/stdout' % HOST_PATH

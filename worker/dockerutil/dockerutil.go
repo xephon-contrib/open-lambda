@@ -16,6 +16,7 @@ const (
 	DOCKER_LABEL_TYPE    = "ol.type"    // container type (sb, olstore, rethinkdb, etc)
 	SANDBOX              = "sandbox"
 	BASE_IMAGE           = "lambda"
+	INSTALLER_IMAGE      = "offline_installer"
 	POOL                 = "pool"
 	POOL_IMAGE           = "server-pool"
 )
