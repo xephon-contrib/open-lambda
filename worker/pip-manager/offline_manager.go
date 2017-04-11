@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
-	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +41,8 @@ type OfflineInstaller struct {
 	pipMirror    string
 	unpackMirror string
 	depGraph     map[Package][]Package // package -> dependencies
+	depList      [][]Package           // produce ordered depGraph for continuous printing
+	logger       *log.Logger
 }
 
 func NewOfflineInstaller(pipMirror string, unpackMirror string) (*OfflineInstaller, error) {
@@ -70,6 +72,7 @@ func NewOfflineInstaller(pipMirror string, unpackMirror string) (*OfflineInstall
 	// Read dependencies from file if exists
 	depsFile := filepath.Join(absUnpackMirror, "deps.txt")
 	depGraph := map[Package][]Package{}
+	depList := [][]Package{}
 	if _, err := os.Stat(depsFile); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	} else if err == nil {
@@ -88,6 +91,7 @@ func NewOfflineInstaller(pipMirror string, unpackMirror string) (*OfflineInstall
 					})
 				}
 				depGraph[pkgs[0]] = pkgs[1:]
+				depList = append(depList, pkgs)
 			}
 		}
 	}
@@ -98,6 +102,7 @@ func NewOfflineInstaller(pipMirror string, unpackMirror string) (*OfflineInstall
 		pipMirror:    pipMirror,
 		unpackMirror: absUnpackMirror,
 		depGraph:     depGraph,
+		depList:      depList,
 	}
 
 	return manager, nil
@@ -165,12 +170,13 @@ func (o *OfflineInstaller) Resolve(specs []string) ([]Package, error) {
 func (o *OfflineInstaller) prepare(pkg Package) error {
 	pkgstr := pkg.String()
 	if _, ok := o.depGraph[pkg]; ok {
+		o.logger.Printf("Package already installed: %v", pkg)
 		return nil
 	}
 	// avoid circular dependencies.
 	o.depGraph[pkg] = nil
 
-	fmt.Printf("Installing package %v\n", pkg)
+	o.logger.Printf("Installing package: %v", pkg)
 
 	installDir := o.installDir(pkg)
 	if err := os.MkdirAll(installDir, os.ModeDir); err != nil {
@@ -199,11 +205,9 @@ func (o *OfflineInstaller) prepare(pkg Package) error {
 				},
 			},
 			HostConfig: &docker.HostConfig{
-				//AutoRemove: true,
-				Binds: binds,
-				// TODO: update go-dockerclient to support tmpfs
-				//ReadonlyRootfs: true,
-				//Tmpfs: map[string]string{"/tmp": ""},
+				Binds:          binds,
+				ReadonlyRootfs: true,
+				Tmpfs:          map[string]string{"/tmp": ""},
 			},
 		},
 	)
@@ -289,6 +293,7 @@ func (o *OfflineInstaller) prepare(pkg Package) error {
 	}
 
 	o.depGraph[pkg] = resolved
+	o.depList = append(o.depList, append([]Package{pkg}, resolved...))
 	return nil
 }
 
@@ -302,33 +307,41 @@ func (o *OfflineInstaller) Prepare(pkgs []string) ([]string, error) {
 		return nil, err
 	}
 
+	logPath := filepath.Join(o.unpackMirror, "offline_installer.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return nil, err
+	}
+	defer logFile.Close()
+	o.logger = log.New(logFile, "", log.LstdFlags)
+
+	depsPath := filepath.Join(o.unpackMirror, "deps.txt")
+	depsFile, err := os.Create(depsPath)
+	if err != nil {
+		return nil, err
+	}
+	defer depsFile.Close()
+
+	oldDepsLen := len(o.depList)
+
 	for idx, pkg := range resolved {
-		fmt.Printf("(%d/%d) Preparing package %v\n", idx+1, len(resolved), pkg)
+		o.logger.Printf("(%d/%d) Preparing package %v", idx+1, len(resolved), pkg)
 		if pkg.Version == "" {
-			fmt.Printf("%s: version resolution fails\n", pkgs[idx])
+			o.logger.Printf("%s: version resolution fails", pkgs[idx])
 			remains = append(remains, pkgs[idx])
 		} else if err := o.prepare(pkg); err != nil {
-			fmt.Printf("%s: installation fails: %s\n", pkgs[idx], err.Error())
+			o.logger.Printf("%s: installation fails: %s", pkgs[idx], err.Error())
 			remains = append(remains, pkgs[idx])
 		}
-	}
-
-	// write dependencies to file
-	depsText := ""
-	for pkg, deps := range o.depGraph {
-		if deps == nil {
-			continue
+		// write dependencies on the fly
+		for _, deps := range o.depList[oldDepsLen:] {
+			depsFile.WriteString(deps[0].String())
+			for _, dep := range deps[1:] {
+				depsFile.WriteString(" " + dep.String())
+			}
+			depsFile.WriteString("\n")
 		}
-		depsText += pkg.String()
-		for _, dep := range deps {
-			depsText += " " + dep.String()
-		}
-		depsText += "\n"
-	}
-
-	depsFile := filepath.Join(o.unpackMirror, "deps.txt")
-	if err := ioutil.WriteFile(depsFile, []byte(depsText), 0644); err != nil {
-		return nil, err
+		oldDepsLen = len(o.depList)
 	}
 
 	return remains, nil
