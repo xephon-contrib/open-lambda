@@ -713,10 +713,10 @@ func install(ctx *cli.Context) error {
 		}
 	}
 
-	if offlineInstaller, err := pip.NewOfflineInstaller(index, target); err != nil {
-		log.Fatal("fail to create offline installer: ", err)
-	} else if remains, err := offlineInstaller.Prepare(reqs); err != nil {
-		log.Fatal("fail to prepare offline mirror: ", err)
+	if m, err := pip.NewUnpackMirrorServer(index, target); err != nil {
+		log.Fatal("fail to create unpack mirror server: ", err)
+	} else if remains, err := m.Prepare(reqs); err != nil {
+		log.Fatal("fail to prepare unpack mirror: ", err)
 	} else {
 		remainsLog := filepath.Join(target, "remains.log")
 		if err := ioutil.WriteFile(remainsLog, []byte(strings.Join(remains, "\n")), 0644); err != nil {

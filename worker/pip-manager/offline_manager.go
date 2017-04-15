@@ -3,49 +3,47 @@ package pip
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	docker "github.com/fsouza/go-dockerclient"
 
 	"github.com/open-lambda/open-lambda/worker/dockerutil"
 )
 
+type UnpackMirrorClient struct {
+	BasicPipManager
+	unpackMirror string
+}
+
+func (c *UnpackMirrorClient) Unpack(targetDir string, pkgs []Package) (remains []Package, err error) {
+	return nil, nil
+}
+
 /*
  * OfflineInstallManager is the interface for installing unpack-only pip packages.
  */
 
-type OfflineInstallManager interface {
+type UnpackMirrorManager interface {
 	Prepare(pkgs []string) ([]string, error)
 	Unpack(handler string, pkgs []string) ([]string, error)
 }
 
-// Package identifies a package with its name and an exact version.
-type Package struct {
-	Name    string
-	Version string
-}
-
-func (p Package) String() string {
-	return fmt.Sprintf("%s,%s", p.Name, p.Version)
-}
-
-type OfflineInstaller struct {
+type UnpackMirrorServer struct {
+	BasicPipManager
 	client       *docker.Client
-	script       string
-	pipMirror    string
 	unpackMirror string
 	depGraph     map[Package][]Package // package -> dependencies
-	depList      [][]Package           // produce ordered depGraph for continuous printing
-	logger       *log.Logger
+	graphMtx     *sync.Mutex           // access mutex to depGraph
 }
 
-func NewOfflineInstaller(pipMirror string, unpackMirror string) (*OfflineInstaller, error) {
+func NewUnpackMirrorServer(pipMirror string, unpackMirror string) (*UnpackMirrorServer, error) {
 	var client *docker.Client
 	if c, err := docker.NewClientFromEnv(); err != nil {
 		return nil, err
@@ -53,19 +51,8 @@ func NewOfflineInstaller(pipMirror string, unpackMirror string) (*OfflineInstall
 		client = c
 	}
 
-	if pipMirror == "" {
-		pipMirror = "https://pypi.python.org/simple"
-	}
 	absUnpackMirror, err := filepath.Abs(unpackMirror)
 	if err != nil {
-		return nil, err
-	}
-
-	// TODO: better way to find the script
-	script := filepath.Join(filepath.Dir(os.Args[0]), "..", "worker", "pip-manager", "scripts", "pip_patched.py")
-	script, _ = filepath.Abs(script)
-
-	if err := os.MkdirAll(absUnpackMirror, os.ModeDir); err != nil {
 		return nil, err
 	}
 
@@ -96,40 +83,31 @@ func NewOfflineInstaller(pipMirror string, unpackMirror string) (*OfflineInstall
 		}
 	}
 
-	manager := &OfflineInstaller{
-		client:       client,
-		script:       script,
-		pipMirror:    pipMirror,
-		unpackMirror: absUnpackMirror,
-		depGraph:     depGraph,
-		depList:      depList,
+	manager := &UnpackMirrorServer{
+		BasicPipManager: *NewBasicPipManager(pipMirror),
+		client:          client,
+		unpackMirror:    absUnpackMirror,
+		depGraph:        depGraph,
+		graphMtx:        &sync.Mutex{},
 	}
 
 	return manager, nil
 }
 
-// installDir gets the installation directory of a package in the unpack mirror.
-func (o *OfflineInstaller) installDir(pkg Package) string {
-	pkgstr := pkg.String()
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(pkgstr)))
-	return filepath.Join(o.unpackMirror, "packages", hash[:2], hash[2:4], hash[4:], pkgstr)
-}
-
 // getAllDeps gets the recursive dependencies of pkg and stores the result in allDeps.
-func (o *OfflineInstaller) getAllDeps(pkg Package, allDeps map[Package]bool) error {
+func (m *UnpackMirrorServer) getAllDeps(pkg Package, allDeps map[Package]bool) error {
 	if _, ok := allDeps[pkg]; ok {
 		return nil
 	}
-	if deps, ok := o.depGraph[pkg]; !ok {
-		return fmt.Errorf("package %v has not been installed\n", pkg)
+	if deps, ok := m.depGraph[pkg]; !ok {
+		return fmt.Errorf("[%v] has not been installed", pkg)
 	} else if deps == nil {
-		return fmt.Errorf("package %v cannot be installed\n", pkg)
+		return fmt.Errorf("[%v] cannot be installed", pkg)
 	} else {
 		allDeps[pkg] = true
 		for _, dep := range deps {
-			if err := o.getAllDeps(dep, allDeps); err != nil {
-				// should not get here
-				return fmt.Errorf("from %s: %v", pkg.String(), err)
+			if err := m.getAllDeps(dep, allDeps); err != nil {
+				return fmt.Errorf("[%v] %v", pkg, err)
 			}
 		}
 		return nil
@@ -137,50 +115,39 @@ func (o *OfflineInstaller) getAllDeps(pkg Package, allDeps map[Package]bool) err
 }
 
 // GetAllDeps gets the recursive dependencies of pkg.
-func (o *OfflineInstaller) GetAllDeps(pkg Package) (map[Package]bool, error) {
+func (m *UnpackMirrorServer) GetAllDeps(pkg Package) (map[Package]bool, error) {
 	allDeps := map[Package]bool{}
-	if err := o.getAllDeps(pkg, allDeps); err != nil {
+	if err := m.getAllDeps(pkg, allDeps); err != nil {
 		return nil, err
 	}
 	return allDeps, nil
 }
 
-// Resolve resolves the exact version given a package specification.
-func (o *OfflineInstaller) Resolve(specs []string) ([]Package, error) {
-	cmd := exec.Command("python", append([]string{
-		o.script, "resolve", "-qqq", "-i", o.pipMirror,
-	}, specs...)...)
-	if output, err := cmd.Output(); err != nil {
-		return nil, fmt.Errorf("fail to resolve packages: %s", string(err.(*exec.ExitError).Stderr))
-	} else {
-		resolved := []Package{}
-		scanner := bufio.NewScanner(bytes.NewBuffer(output))
-		for scanner.Scan() {
-			parts := strings.Split(scanner.Text(), ",")
-			resolved = append(resolved, Package{
-				Name:    strings.ToLower(parts[0]),
-				Version: parts[1],
-			})
-		}
-		return resolved, nil
-	}
-}
-
 // prepare installs a package in the unpack mirror and archives it.
-func (o *OfflineInstaller) prepare(pkg Package) error {
-	pkgstr := pkg.String()
-	if _, ok := o.depGraph[pkg]; ok {
-		o.logger.Printf("Package already installed: %v", pkg)
-		return nil
+func (m *UnpackMirrorServer) prepare(pkg Package, taskChan chan bool, group *sync.WaitGroup, depsLog *log.Logger, commLog *log.Logger) {
+	taskChan <- true
+	defer group.Done()
+	defer func() {
+		<-taskChan
+	}()
+
+	m.graphMtx.Lock()
+	if _, ok := m.depGraph[pkg]; ok {
+		commLog.Printf("[%v] already installed\n", pkg)
+		m.graphMtx.Unlock()
+		return
+	} else {
+		commLog.Printf("[%v] installation start\n", pkg)
+		m.depGraph[pkg] = nil
+		m.graphMtx.Unlock()
 	}
-	// avoid circular dependencies.
-	o.depGraph[pkg] = nil
 
-	o.logger.Printf("Installing package: %v", pkg)
+	pkgstr := pkg.String()
 
-	installDir := o.installDir(pkg)
+	installDir := filepath.Join(m.unpackMirror, "packages", pkg.installDir())
 	if err := os.MkdirAll(installDir, os.ModeDir); err != nil {
-		return fmt.Errorf("[from %v] %v", pkg, err)
+		commLog.Printf("[%v] error during mkdir: %v\n", pkg, err)
+		return
 	}
 
 	// installation directory inside container.
@@ -191,7 +158,7 @@ func (o *OfflineInstaller) prepare(pkg Package) error {
 
 	spec := fmt.Sprintf("%s==%s", pkg.Name, pkg.Version)
 
-	container, err := o.client.CreateContainer(
+	container, err := m.client.CreateContainer(
 		docker.CreateContainerOptions{
 			Config: &docker.Config{
 				Image: dockerutil.INSTALLER_IMAGE,
@@ -200,7 +167,7 @@ func (o *OfflineInstaller) prepare(pkg Package) error {
 					"pip_patched.py", "install",
 					"-t", pkgdir,
 					"-qqq",
-					"-i", o.pipMirror,
+					"-i", m.pipMirror,
 					spec,
 				},
 			},
@@ -213,35 +180,72 @@ func (o *OfflineInstaller) prepare(pkg Package) error {
 	)
 	if err != nil {
 		os.RemoveAll(installDir)
-		return fmt.Errorf("[from %v] fail to create installation container: %v", pkg, err)
+		commLog.Printf("[%v] fail to create installation container: %v\n", pkg, err)
+		return
 	}
 
-	// equivalent to autoremove
-	defer o.client.RemoveContainer(docker.RemoveContainerOptions{ID: container.ID})
+	if err = m.client.StartContainer(container.ID, nil); err != nil {
+		os.RemoveAll(installDir)
+		commLog.Printf("[%v] fail to install package: %v\n", pkg, err)
+		m.client.RemoveContainer(docker.RemoveContainerOptions{ID: container.ID})
+		return
+	}
 
-	if err = o.client.StartContainer(container.ID, nil); err != nil {
-		os.RemoveAll(installDir)
-		return fmt.Errorf("[from %v] fail to install package: %v", pkg, err)
-	} else if exitcode, err := o.client.WaitContainer(container.ID); err != nil {
-		os.RemoveAll(installDir)
-		return fmt.Errorf("[from %v] error occurs when waiting for container: %v", pkg, err)
-	} else if exitcode != 0 {
-		os.RemoveAll(installDir)
-		var buf bytes.Buffer
-		err = o.client.Logs(docker.LogsOptions{
-			Container:   container.ID,
-			ErrorStream: &buf,
-			Follow:      true,
-			Stderr:      true,
-		})
-		if err != nil {
-			return fmt.Errorf("[from %v] fail to get error logs from installation container: %v", pkg, err)
+	timeout := make(chan bool)
+	exitcodeChan := make(chan int)
+	errChan := make(chan error)
+
+	go func() {
+		time.Sleep(10 * time.Minute)
+		timeout <- true
+	}()
+
+	go func() {
+		if exitcode, err := m.client.WaitContainer(container.ID); err != nil {
+			errChan <- err
+		} else {
+			exitcodeChan <- exitcode
 		}
-		return fmt.Errorf("[from %v] container exited with non-zero code %d: {stderr start}\n%s{stderr end}", pkg, exitcode, buf.String())
+	}()
+
+	select {
+	case <-timeout:
+		err := m.client.KillContainer(docker.KillContainerOptions{ID: container.ID})
+		os.RemoveAll(installDir)
+		if err != nil {
+			commLog.Printf("[%v] fail to kill container %s when installation timeout: %v\n", pkg, container.ID, err)
+		} else {
+			commLog.Printf("[%v] installation timeout\n", pkg)
+		}
+		m.client.RemoveContainer(docker.RemoveContainerOptions{ID: container.ID})
+		return
+	case err = <-errChan:
+		os.RemoveAll(installDir)
+		commLog.Printf("[%v] error during installation: %v\n", pkg, err)
+		m.client.RemoveContainer(docker.RemoveContainerOptions{ID: container.ID})
+		return
+	case exitcode := <-exitcodeChan:
+		if exitcode != 0 {
+			os.RemoveAll(installDir)
+			var buf bytes.Buffer
+			err = m.client.Logs(docker.LogsOptions{
+				Container:   container.ID,
+				ErrorStream: &buf,
+				Follow:      true,
+				Stderr:      true,
+			})
+			if err != nil {
+				commLog.Printf("[%v] fail to get error logs from installation container: %v\n", pkg, err)
+			} else {
+				commLog.Printf("[%v] container exited with non-zero code %d: {stderr start}\n%s{stderr end}\n", pkg, exitcode, buf.String())
+			}
+			m.client.RemoveContainer(docker.RemoveContainerOptions{ID: container.ID})
+			return
+		}
 	}
 
 	var buf bytes.Buffer
-	err = o.client.Logs(docker.LogsOptions{
+	err = m.client.Logs(docker.LogsOptions{
 		Container:    container.ID,
 		OutputStream: &buf,
 		Follow:       true,
@@ -249,7 +253,9 @@ func (o *OfflineInstaller) prepare(pkg Package) error {
 	})
 	if err != nil {
 		os.RemoveAll(installDir)
-		return fmt.Errorf("[from %v] fail to get logs from installation container: %v", pkg, err)
+		m.client.RemoveContainer(docker.RemoveContainerOptions{ID: container.ID})
+		commLog.Printf("[%v] fail to get logs from installation container: %v\n", pkg, err)
+		return
 	}
 
 	deps := []string{}
@@ -263,21 +269,7 @@ func (o *OfflineInstaller) prepare(pkg Package) error {
 		deps = append(deps, fmt.Sprintf("%s%s", name, spec))
 	}
 
-	resolved, err := o.Resolve(deps)
-	if err != nil {
-		os.RemoveAll(installDir)
-		return fmt.Errorf("[from %v] error during resolving dependency versions: %v", pkg, err)
-	}
-
-	for idx, p := range resolved {
-		if p.Version == "" {
-			os.RemoveAll(installDir)
-			return fmt.Errorf("[from %v] cannot resolve dependency: %s", pkg, deps[idx])
-		} else if err := o.prepare(p); err != nil {
-			os.RemoveAll(installDir)
-			return fmt.Errorf("[from %v] %v", pkg, err)
-		}
-	}
+	m.client.RemoveContainer(docker.RemoveContainerOptions{ID: container.ID})
 
 	// compress files with sources removed
 	cmd := exec.Command("tar", "--remove-files", "-zcf", fmt.Sprintf("%s.tar.gz", installDir), "-C", installDir, ".")
@@ -289,59 +281,92 @@ func (o *OfflineInstaller) prepare(pkg Package) error {
 			msg = err.Error()
 		}
 		os.RemoveAll(installDir)
-		return fmt.Errorf("[from %v] error when creating package archive: %s", pkg, msg)
+		commLog.Printf("[%v] error when creating package archive: %s\n", pkg, msg)
+		return
 	}
 
-	o.depGraph[pkg] = resolved
-	o.depList = append(o.depList, append([]Package{pkg}, resolved...))
-	return nil
+	resolved, err := m.Resolve(deps)
+	if err != nil {
+		os.RemoveAll(installDir)
+		commLog.Printf("[%v] error during resolving dependency versions: %v\n", pkg, err)
+		return
+	}
+
+	commLog.Printf("[%v] installation completed\n", pkg)
+
+	m.depGraph[pkg] = resolved
+
+	depsLog.Printf(pkg.String())
+	for _, dep := range resolved {
+		depsLog.Printf(" %v", dep)
+	}
+	depsLog.Printf("\n")
+
+	for idx, p := range resolved {
+		if p.Version == "" {
+			m.depGraph[pkg] = nil
+			commLog.Printf("[%v] cannot resolve dependency: %s\n", pkg, deps[idx])
+		} else {
+			go func() {
+				group.Add(1)
+				taskChan <- true
+				go m.prepare(p, taskChan, group, depsLog, commLog)
+			}()
+		}
+	}
 }
 
 // Prepare installs a list of package specifications and returns a list of
 // remaining ones.
-func (o *OfflineInstaller) Prepare(pkgs []string) ([]string, error) {
+func (m *UnpackMirrorServer) Prepare(pkgs []string) ([]string, error) {
 	remains := []string{}
 
-	resolved, err := o.Resolve(pkgs)
+	resolved, err := m.Resolve(pkgs)
 	if err != nil {
 		return nil, err
 	}
 
-	logPath := filepath.Join(o.unpackMirror, "offline_installer.log")
+	logPath := filepath.Join(m.unpackMirror, "offline_installer.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return nil, err
 	}
 	defer logFile.Close()
-	o.logger = log.New(logFile, "", log.LstdFlags)
+	commLog := log.New(logFile, "", log.LstdFlags)
 
-	depsPath := filepath.Join(o.unpackMirror, "deps.txt")
+	depsPath := filepath.Join(m.unpackMirror, "deps.txt")
 	depsFile, err := os.Create(depsPath)
 	if err != nil {
 		return nil, err
 	}
 	defer depsFile.Close()
+	depsLog := log.New(depsFile, "", 0)
 
-	oldDepsLen := len(o.depList)
+	group := &sync.WaitGroup{}
+	NUM_THREADS := 4
+	taskChan := make(chan bool, NUM_THREADS)
 
 	for idx, pkg := range resolved {
-		o.logger.Printf("(%d/%d) Preparing package %v", idx+1, len(resolved), pkg)
+		commLog.Printf("(%d/%d) Preparing package %v", idx+1, len(resolved), pkg)
 		if pkg.Version == "" {
-			o.logger.Printf("%s: version resolution fails", pkgs[idx])
+			commLog.Printf("[%s] version resolution fails", pkgs[idx])
 			remains = append(remains, pkgs[idx])
-		} else if err := o.prepare(pkg); err != nil {
-			o.logger.Printf("%s: installation fails: %s", pkgs[idx], err.Error())
-			remains = append(remains, pkgs[idx])
+		} else {
+			group.Add(1)
+			taskChan <- true
+			go m.prepare(pkg, taskChan, group, depsLog, commLog)
 		}
-		// write dependencies on the fly
-		for _, deps := range o.depList[oldDepsLen:] {
-			depsFile.WriteString(deps[0].String())
-			for _, dep := range deps[1:] {
-				depsFile.WriteString(" " + dep.String())
+	}
+
+	group.Wait()
+
+	for idx, pkg := range resolved {
+		if pkg.Version != "" {
+			if _, err := m.GetAllDeps(pkg); err != nil {
+				commLog.Printf("%v\n", err)
+				remains = append(remains, pkgs[idx])
 			}
-			depsFile.WriteString("\n")
 		}
-		oldDepsLen = len(o.depList)
 	}
 
 	return remains, nil
@@ -349,18 +374,18 @@ func (o *OfflineInstaller) Prepare(pkgs []string) ([]string, error) {
 
 // TODO: eviction
 // Unpack decompresses a list of archived installed packages to a target directory.
-func (o *OfflineInstaller) Unpack(targetDir string, pkgs []string) ([]string, error) {
+func (m *UnpackMirrorServer) Unpack(targetDir string, pkgs []string) ([]string, error) {
 	allDeps := map[Package]bool{}
 	toInstall := []string{}
 
-	if resolved, err := o.Resolve(pkgs); err != nil {
+	if resolved, err := m.Resolve(pkgs); err != nil {
 		return nil, err
 	} else {
 		for idx, pkg := range resolved {
 			if pkg.Version == "" {
 				fmt.Printf("specification cannot be resolved: %s\n", pkgs[idx])
 				toInstall = append(toInstall, pkgs[idx])
-			} else if deps, err := o.GetAllDeps(resolved[0]); err != nil {
+			} else if deps, err := m.GetAllDeps(resolved[0]); err != nil {
 				fmt.Printf("some dependencies cannot be installed: %v\n", err)
 				toInstall = append(toInstall, pkgs[idx])
 			} else {
@@ -379,7 +404,7 @@ func (o *OfflineInstaller) Unpack(targetDir string, pkgs []string) ([]string, er
 	}
 
 	for _, pkg := range oneVersion {
-		archive := o.installDir(pkg) + ".tar.gz"
+		archive := filepath.Join(m.unpackMirror, "packages", pkg.installDir()) + ".tar.gz"
 
 		cmd := exec.Command("tar", "-xf", archive, "-C", targetDir)
 		if err := cmd.Run(); err != nil {

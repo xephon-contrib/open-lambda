@@ -27,8 +27,8 @@ type Config struct {
 	Cluster_name string `json:"cluster_name"`
 	// pip mirror address for installing python packages
 	Pip_mirror string `json:"pip_mirror"`
-	// pip mirror for archived installed python packages
-	Unpack_mirror string `json:"unpack_mirror"`
+	// directory for storing unpacked python packages
+	Packages_dir string `json:"packages_dir"`
 
 	// pool options
 	// directory storing socket files for each forked server

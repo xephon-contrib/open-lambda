@@ -31,16 +31,15 @@ type HandlerSetOpts struct {
 // HandlerSet represents a collection of Handlers of a worker server. It
 // manages the Handler by HandlerLRU.
 type HandlerSet struct {
-	mutex            sync.Mutex
-	handlers         map[string]*Handler
-	regMgr           registry.RegistryManager
-	sbFactory        sb.SandboxFactory
-	poolMgr          pmanager.PoolManager
-	config           *config.Config
-	installer        pip.InstallManager
-	offlineInstaller pip.OfflineInstallManager
-	lru              *HandlerLRU
-	workerDir        string
+	mutex     sync.Mutex
+	handlers  map[string]*Handler
+	regMgr    registry.RegistryManager
+	sbFactory sb.SandboxFactory
+	poolMgr   pmanager.PoolManager
+	config    *config.Config
+	installer pip.InstallManager
+	lru       *HandlerLRU
+	workerDir string
 }
 
 // Handler handles requests to run a lambda on a worker server. It handles
@@ -81,20 +80,14 @@ func NewHandlerSet(config *config.Config, lru *HandlerLRU) (handlerSet *HandlerS
 
 	installer := pip.NewInstaller(config)
 
-	offlineInstaller, err := pip.NewOfflineInstaller(config.Pip_mirror, config.Unpack_mirror)
-	if err != nil {
-		return nil, err
-	}
-
 	handlerSet = &HandlerSet{
-		handlers:         make(map[string]*Handler),
-		regMgr:           rm,
-		sbFactory:        sf,
-		poolMgr:          pm,
-		installer:        installer,
-		offlineInstaller: offlineInstaller,
-		lru:              lru,
-		workerDir:        config.Worker_dir,
+		handlers:  make(map[string]*Handler),
+		regMgr:    rm,
+		sbFactory: sf,
+		poolMgr:   pm,
+		installer: installer,
+		lru:       lru,
+		workerDir: config.Worker_dir,
 	}
 
 	return handlerSet, nil
@@ -158,11 +151,6 @@ func (h *Handler) RunStart() (ch *sb.SandboxChannel, err error) {
 
 		if err := os.MkdirAll(h.pipDir, os.ModeDir); err != nil {
 			return nil, err
-		}
-		if remains, err := h.hset.offlineInstaller.Unpack(h.pipDir, h.installs); err != nil {
-			return nil, err
-		} else {
-			h.installs = remains
 		}
 	}
 
