@@ -6,6 +6,7 @@ import tornado.web
 import tornado.httpserver
 import tornado.netutil
 from subprocess import check_output
+import hashlib
 
 import ns
 
@@ -79,6 +80,23 @@ def lambda_server():
     tornado.ioloop.IOLoop.instance().start()
     server.start(PROCESSES_DEFAULT)
 
+# create symbolic links from install cache to dist-packages, return if success
+def create_link(pkg):
+    # assume format "<pkgname>==<version>"
+    # _pkg = ','.join(pkg.split('=='))
+    # hsh = hashlib.sha256(_pkg).hexdigest()
+    # pkgdir = '/packages/%s/%s/%s/%s' % (hsh[:2], hsh[2:4], hsh[4:], _pkg)
+    pkgdir = '/packages/%s' % pkg
+    if os.path.exists(pkgdir):
+        for name in os.listdir(pkgdir):
+            source = pkgdir + '/' + name
+            link_name = '/usr/lib/python2.7/dist-packages/' + name
+            if os.path.exists(link_name):
+                continue # should we report this?
+            os.symlink(source, link_name)
+        return True
+    return False
+
 # listen for fds to forkenter
 def fdlisten(path):
     signal = "cache"
@@ -98,16 +116,20 @@ def fdlisten(path):
         r = ns.forkenter()
         if r == 0:
             redirect()
+            
             # install & import packages
             for k, pkg in enumerate(pkgs):
                 if k < len(pkgs)-1:
                     split = pkg.split(':')
                     if split[1] != '':
-                        print('installing: %s' % split[1])
-                        try:
-                            install(split[1])
-                        except Exception as e: 
-                            print('install %s failed with: %s' % (split[1], e))
+                        if create_link(split[1]):
+                            print('using install cache: %s' % split[1])
+                        else:
+                            print('installing: %s' % split[1])
+                            try:
+                                install(split[1])
+                            except Exception as e: 
+                                print('install %s failed with: %s' % (split[1], e))
 
                         sys.stdout.flush()
                         sys.stderr.flush()
